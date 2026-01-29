@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
-import argparse, json, os, random, shutil, tempfile, time, csv, logging
+import argparse, json, os, random, shutil, tempfile, time, csv, logging, gc
 from functools import partial
 from pathlib import Path
 from typing import Literal, Optional, Dict, List, Callable, Any
 
 import numpy as np, optuna, torch
 from optuna.pruners import MedianPruner
+from optuna.samplers import TPESampler
 from datasets import load_dataset
 from optuna.trial import Trial
 from pydantic_settings import BaseSettings
@@ -93,6 +94,23 @@ METRIC_EVALUATORS: Dict[str, Callable[[Dict[str, float]], float]] = {
 
 def _auto_direction(metric: str) -> str:
     return "maximize" if metric.lower() in {"accuracy", "f1"} else "minimize"
+
+
+def _is_oom(e: BaseException) -> bool:
+    msg = str(e).lower()
+    return (
+        isinstance(e, torch.cuda.OutOfMemoryError)
+        or "cuda out of memory" in msg
+        or "failed to allocate" in msg
+        or ("cublas" in msg and "alloc" in msg)
+    )
+
+
+def _cleanup_cuda():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 # ═════════════════════ Search-space sampler ══════════════════════════
@@ -310,13 +328,26 @@ def objective(
         metrics_avgs = []
         for _ in range(hp_cfg.time_repeats):
             prune_cb = OptunaPruningCallback(trial, objective_metrics[0])
-            metrics_avgs.append(_train_once(cfg, train_json, val_json, prune_cb))
+            try:
+                metrics_avgs.append(_train_once(cfg, train_json, val_json, prune_cb))
+            except Exception as e:
+                if _is_oom(e):
+                    eff = int(cfg.per_device_train_batch_size) * int(cfg.gradient_accumulation_steps)
+                    trial.set_user_attr("oom_violation", 1.0)
+                    trial.set_user_attr("effective_batch", eff)
+                    _cleanup_cuda()
+                    penalty = 1e9 + 1e6 * eff
+                    return penalty if len(objective_metrics) == 1 else tuple([penalty] * len(objective_metrics))
+                raise
 
         metrics = {
             k: float(np.mean([d[k] for d in metrics_avgs])) for k in metrics_avgs[0]
         }
 
         model, tok = FastLanguageModel.from_pretrained(cfg.model_save_path)
+
+        trial.set_user_attr("oom_violation", 0.0)
+        trial.set_user_attr("effective_batch", int(cfg.per_device_train_batch_size) * int(cfg.gradient_accumulation_steps))
 
         for k, v in metrics.items():
             trial.set_user_attr(k, v)
@@ -340,7 +371,7 @@ def objective(
 
     finally:
         shutil.rmtree(work, ignore_errors=True)
-        torch.cuda.empty_cache()
+        _cleanup_cuda()
 
 
 # ═══════════════════ id_prop.csv loader  ════════════════════
@@ -437,7 +468,11 @@ def main() -> None:
 
     sampler = SearchSpaceSampler(hp_cfg.parameters)
     pruner = optuna.pruners.MedianPruner(n_warmup_steps=1)
-    study = optuna.create_study(directions=directions, pruner=pruner)
+    opt_sampler = TPESampler(
+        multivariate=True,
+        constraints_func=lambda t: (t.user_attrs.get("oom_violation", 0.0),),
+    )
+    study = optuna.create_study(directions=directions, pruner=pruner, sampler=opt_sampler)
 
     wall = time.time()
     study.optimize(
