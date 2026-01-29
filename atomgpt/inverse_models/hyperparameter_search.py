@@ -50,10 +50,8 @@ with this script
 class OptunaSearchConfig(BaseSettings):
     parameters: Dict[str, Dict]
     n_trials: int = 30
-    objective_metric: str | None = None
-    objective_metrics: List[str] | None = None
-    study_direction: str | None = None
-    study_directions: List[str] | None = None
+    objective_metric: str | List[str] | None = None
+    study_direction: str | List[str] | None = None
     time_repeats: int = 1
 
 
@@ -425,14 +423,17 @@ def main() -> None:
     train_cfg = TrainingPropConfig(**json.load(open(args.config_name)))
     hp_cfg = OptunaSearchConfig(**json.load(open(train_cfg.hp_cfg_path)))
 
-    objective_metrics = hp_cfg.objective_metrics or (
-        [hp_cfg.objective_metric] if hp_cfg.objective_metric else ["final_eval_loss"]
-    )
-    directions = hp_cfg.study_directions or (
-        [hp_cfg.study_direction] if hp_cfg.study_direction else None
-    )
-    if directions is None:
+    obj = hp_cfg.objective_metric or "final_eval_loss"
+    objective_metrics = [obj] if isinstance(obj, str) else list(obj)
+
+    dirs = hp_cfg.study_direction
+    if dirs is None:
         directions = [_auto_direction(k) for k in objective_metrics]
+    else:
+        directions = [dirs] if isinstance(dirs, str) else list(dirs)
+
+    if len(directions) == 1 and len(objective_metrics) > 1:
+        directions = directions * len(objective_metrics)
 
     if _DEBUG:
         log.debug("Objectives: %s | Directions: %s", objective_metrics, directions)
