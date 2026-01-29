@@ -29,7 +29,7 @@ from pydantic_settings import BaseSettings
 from peft import PeftModel
 
 # Child-only heavy imports (torch / unsloth / trl) happen inside _run_child_trial()
-# so the parent process stays “CUDA-pristine”.
+# so the parent process stays CUDA-pristine.
 
 from atomgpt.inverse_models.inverse_models import (
     formatting_prompts_func,
@@ -42,10 +42,13 @@ from jarvis.core.atoms import Atoms
 from jarvis.db.jsonutils import dumpjson
 
 
-# ───────────────────────────── Logging ──────────────────────────────
+# ---------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------
 _DEBUG = os.getenv("ATOMGPT_DEBUG", "").lower() in {"1", "true", "yes", "y"}
+_PRETTY = os.getenv("ATOMGPT_PRETTY", "1").lower() not in {"0", "false", "no", "n"}
 
-# Reduce Optuna chatter; we’ll print our own tidy summaries.
+# Reduce Optuna chatter; we print our own summaries.
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 logging.basicConfig(
@@ -56,75 +59,80 @@ logging.basicConfig(
 log = logging.getLogger("hp_search")
 
 
-# ───────────────────────── Pretty console helpers ─────────────────────────
-_PRETTY = os.getenv("ATOMGPT_PRETTY", "1").lower() not in {"0", "false", "no", "n"}
-
+# ---------------------------------------------------------------------
+# Pretty console helpers (ASCII-only)
+# ---------------------------------------------------------------------
 def _truncate(s: str, n: int) -> str:
     s = str(s)
-    return s if len(s) <= n else (s[: n - 1] + "…")
+    if len(s) <= n:
+        return s
+    if n <= 3:
+        return s[:n]
+    return s[: n - 3] + "..."
+
 
 def _fmt_num(x: Any, *, nd: int = 4) -> str:
     try:
         xf = float(x)
     except Exception:
         return str(x)
-    # Prefer compact for big numbers
     if abs(xf) >= 1e4 or (abs(xf) > 0 and abs(xf) < 1e-3):
         return f"{xf:.3g}"
     return f"{xf:.{nd}f}"
 
-def _pad(s: str, n: int, align: str = "<") -> str:
-    return f"{s:{align}{n}}"
 
-def _box(title: str, lines: Sequence[str], width: int = 88) -> str:
+def _box(title: str, lines: Sequence[str], width: int = 92) -> str:
     if not _PRETTY:
         out = [f"== {title} =="] + list(lines)
         return "\n".join(out)
 
-    # Unicode box drawing, tasteful (not gaudy)
     w = max(width, len(title) + 6, *(len(x) + 4 for x in lines) if lines else [width])
-    top = f"╭{'─'*(w-2)}╮"
-    mid = f"│ {_pad(title, w-4)} │"
-    sep = f"├{'─'*(w-2)}┤"
-    body = [f"│ {_pad(x, w-4)} │" for x in lines]
-    bot = f"╰{'─'*(w-2)}╯"
+    top = "+" + "-" * (w - 2) + "+"
+    mid = "| " + f"{title:<{w-4}}" + " |"
+    sep = "+" + "-" * (w - 2) + "+"
+    body = ["| " + f"{x:<{w-4}}" + " |" for x in lines]
+    bot = "+" + "-" * (w - 2) + "+"
     return "\n".join([top, mid, sep, *body, bot])
 
-def _one_line_trial_summary(
+
+def _dir_ascii(d: str) -> str:
+    return "min" if d == "minimize" else ("max" if d == "maximize" else str(d))
+
+
+def _trial_summary_lines(
     trial: optuna.trial.FrozenTrial,
     objective_metrics: List[str],
-    *,
-    max_params_chars: int = 42,
-) -> str:
-    state = trial.state.name
+) -> List[str]:
+    state = trial.state.name  # COMPLETE / FAIL / PRUNED / RUNNING
     num = trial.number
-    mark = "✓" if state == "COMPLETE" else ("×" if state == "FAIL" else "…")
+
+    if state == "COMPLETE":
+        badge = "OK"
+    elif state == "FAIL":
+        badge = "FAIL"
+    elif state == "PRUNED":
+        badge = "PRUN"
+    else:
+        badge = state[:4]
 
     micro = trial.params.get("per_device_train_batch_size", None)
     gas = trial.params.get("gradient_accumulation_steps", None)
     eff = trial.user_attrs.get("effective_batch", None)
 
-    # Objectives + labeled mapping
-    if state == "COMPLETE" and trial.values is not None:
-        vals = ", ".join(_fmt_num(v, nd=4) for v in trial.values)
-        labels = ", ".join(objective_metrics)
-        obj_map = f"[{vals}]  ↔  [{labels}]"
-    else:
-        obj_map = "—"
-
-    # A couple “headline” metrics for fast scanning
     tt = trial.user_attrs.get("training_time", None)
     fel = trial.user_attrs.get("final_eval_loss", None)
+    ftl = trial.user_attrs.get("final_train_loss", None)
 
     headline = []
     if tt is not None:
         headline.append(f"time={_fmt_num(tt, nd=2)}s")
     if fel is not None:
-        headline.append(f"final_eval={_fmt_num(fel, nd=4)}")
+        headline.append(f"final_eval={_fmt_num(fel, nd=6)}")
+    if ftl is not None:
+        headline.append(f"final_train={_fmt_num(ftl, nd=6)}")
+    if not headline:
+        headline.append("no metrics")
 
-    head = "  ".join(headline) if headline else "no metrics"
-
-    # Params compact
     pfrag = []
     if micro is not None:
         pfrag.append(f"micro={micro}")
@@ -132,21 +140,49 @@ def _one_line_trial_summary(
         pfrag.append(f"gas={gas}")
     if eff is not None:
         pfrag.append(f"eff={eff}")
-    pfrag = " ".join(pfrag) if pfrag else "params=—"
+    params = " ".join(pfrag) if pfrag else "params=--"
 
-    # Any failure note
     fail = trial.user_attrs.get("failure", "")
     if state != "COMPLETE" and fail:
-        fail = f"  reason={_truncate(fail, 22)}"
-    elif state != "COMPLETE":
+        fail = f"  reason={_truncate(fail, 28)}"
+    else:
         fail = ""
 
-    # Also show user’s chosen objective mapping right on the summary line
-    params_str = _truncate(pfrag, max_params_chars)
-    return f"[Trial {num:02d} {mark}] {head}  |  {params_str}{fail}\n            objectives: {obj_map}"
+    if state == "COMPLETE" and trial.values is not None:
+        vals = ", ".join(_fmt_num(v, nd=8) for v in trial.values)
+        labels = ", ".join(objective_metrics)
+        mapping = f"[{vals}] <-> [{labels}]"
+    else:
+        mapping = f"[--] <-> [{', '.join(objective_metrics)}]"
+
+    line1 = f"Trial {num:02d} [{badge}]  {'  '.join(headline)}"
+    line2 = f"params: {params}{fail}"
+    line3 = f"objectives: {mapping}"
+    return [line1, line2, line3]
 
 
-# ───────────────────────────── Config ───────────────────────────────
+def _make_trial_callback(objective_metrics: List[str]):
+    def _cb(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        lines = _trial_summary_lines(trial, objective_metrics)
+
+        # Small context (best/pareto) appended as a final line
+        if len(study.directions) == 1:
+            try:
+                ctx = f"best so far: {_fmt_num(study.best_value, nd=8)}"
+            except Exception:
+                ctx = "best so far: --"
+        else:
+            ctx = f"pareto size: {len(study.best_trials)}"
+
+        lines.append(ctx)
+        log.info("\n%s", _box("Trial summary", lines, width=92))
+
+    return _cb
+
+
+# ---------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------
 class OptunaSearchConfig(BaseSettings):
     parameters: Dict[str, Dict]
     n_trials: int = 30
@@ -155,20 +191,24 @@ class OptunaSearchConfig(BaseSettings):
     time_repeats: int = 1
 
 
-# ───────────────────────── Metric helpers ───────────────────────────
+# ---------------------------------------------------------------------
+# Metric helpers
+# ---------------------------------------------------------------------
 def last_value(xs: List[float]) -> float:
     return float("inf") if not xs else float(xs[-1])
 
+
 def area_under_curve(xs: List[float]) -> float:
-    # np.trapz is deprecated; use trapezoid when available
     if not xs:
         return float("inf")
     if hasattr(np, "trapezoid"):
         return float(np.trapezoid(xs))
     return float(np.trapz(xs))
 
+
 def trend_slope(xs: List[float]) -> float:
     return float("inf") if len(xs) < 2 else abs(np.polyfit(range(len(xs)), xs, 1)[0])
+
 
 METRIC_EVALUATORS: Dict[str, Callable[[Dict[str, float]], float]] = {
     "training_time": lambda m: m["training_time"],
@@ -180,23 +220,30 @@ METRIC_EVALUATORS: Dict[str, Callable[[Dict[str, float]], float]] = {
     "slope_eval_loss": lambda m: m["slope_eval_loss"],
 }
 
+
 def _auto_direction(metric: str) -> str:
     return "maximize" if metric.lower() in {"accuracy", "f1"} else "minimize"
 
 
-# ───────────────────── Parent-safe seed setting ──────────────────────
+# ---------------------------------------------------------------------
+# Parent-safe seed setting (CPU only)
+# ---------------------------------------------------------------------
 def _set_seeds_cpu(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     # Intentionally NO torch here (parent process must not touch CUDA).
 
 
-# ───────────────────────── Trial crash type ──────────────────────────
+# ---------------------------------------------------------------------
+# Trial crash type
+# ---------------------------------------------------------------------
 class TrialCrashed(RuntimeError):
     """Raised when a per-trial subprocess exits abnormally (segfault, killed, etc.)."""
 
 
-# ───────────────────────── Search-space sampler ──────────────────────
+# ---------------------------------------------------------------------
+# Search-space sampler
+# ---------------------------------------------------------------------
 class SearchSpaceSampler:
     _SUGGEST = {
         "float": lambda t, k, s: t.suggest_float(k, s["low"], s["high"], log=s.get("log", False)),
@@ -208,7 +255,7 @@ class SearchSpaceSampler:
         self.space = space
 
     def sample(self, trial: Trial) -> Dict[str, Any]:
-        sampled = {}
+        sampled: Dict[str, Any] = {}
         for k, spec in self.space.items():
             if not spec.get("include", True) or "condition" in spec:
                 continue
@@ -220,12 +267,20 @@ class SearchSpaceSampler:
                 sampled[k] = self._SUGGEST[spec["type"]](trial, k, spec)
 
         if _DEBUG:
-            log.debug("Trial %d — sampled params: %s", trial.number, sampled)
+            log.debug("Trial %d sampled params: %s", trial.number, sampled)
         return sampled
 
 
-# ───────────────────────── Split helpers ─────────────────────────────
-def train_val_test_split_ids(data: List[dict], id_tag: str, seed: int, val_ratio: float, test_ratio: float):
+# ---------------------------------------------------------------------
+# Split helpers
+# ---------------------------------------------------------------------
+def train_val_test_split_ids(
+    data: List[dict],
+    id_tag: str,
+    seed: int,
+    val_ratio: float,
+    test_ratio: float,
+):
     if val_ratio + test_ratio >= 1.0:
         raise ValueError("val_ratio + test_ratio must be < 1.")
     ids = [r[id_tag] for r in data]
@@ -237,7 +292,7 @@ def train_val_test_split_ids(data: List[dict], id_tag: str, seed: int, val_ratio
     n_test = max(1, int(n * test_ratio))
     n_train = n - n_val - n_test
     if n_train <= 0:
-        raise ValueError("Split sizes invalid – make dataset larger or ratios smaller.")
+        raise ValueError("Split sizes invalid; make dataset larger or ratios smaller.")
 
     val_ids = ids[:n_val]
     test_ids = ids[n_val : n_val + n_test]
@@ -245,7 +300,9 @@ def train_val_test_split_ids(data: List[dict], id_tag: str, seed: int, val_ratio
     return train_ids, val_ids, test_ids
 
 
-# ───────────────────────── id_prop.csv loader ────────────────────────
+# ---------------------------------------------------------------------
+# id_prop.csv loader
+# ---------------------------------------------------------------------
 def _load_id_prop_data(id_prop_csv: str, cfg: TrainingPropConfig) -> List[dict]:
     base = Path(id_prop_csv).parent
     with open(id_prop_csv) as fh:
@@ -274,27 +331,37 @@ def _load_id_prop_data(id_prop_csv: str, cfg: TrainingPropConfig) -> List[dict]:
     return records
 
 
-# ───────────────────────── Guardrails & penalties ────────────────────
-def _penalty_for(cfg: TrainingPropConfig, objective_metrics: List[str], base: float = 1e9) -> float | tuple[float, ...]:
+# ---------------------------------------------------------------------
+# Guardrails & penalties
+# ---------------------------------------------------------------------
+def _penalty_for(
+    cfg: TrainingPropConfig,
+    objective_metrics: List[str],
+    base: float = 1e9,
+) -> float | tuple[float, ...]:
     eff = int(cfg.per_device_train_batch_size) * int(cfg.gradient_accumulation_steps)
     p = base + 1e6 * eff
     return p if len(objective_metrics) == 1 else tuple([p] * len(objective_metrics))
+
 
 def _apply_overrides(cfg: TrainingPropConfig, overrides: Dict[str, Any]) -> None:
     for k, v in overrides.items():
         setattr(cfg, k, v)
 
+
 def _model_copy(cfg: TrainingPropConfig) -> TrainingPropConfig:
-    # pydantic v2 prefers model_copy; keep backward compatibility
     if hasattr(cfg, "model_copy"):
         return cfg.model_copy(deep=True)
     return cfg.copy(deep=True)
 
 
-# ───────────────────────── Child trial runner ────────────────────────
+# ---------------------------------------------------------------------
+# Child trial runner
+# ---------------------------------------------------------------------
 def _is_oom_msg(msg: str) -> bool:
     m = msg.lower()
     return ("cuda out of memory" in m) or ("failed to allocate" in m) or ("outofmemoryerror" in m)
+
 
 def _is_cuda_fatal_msg(msg: str) -> bool:
     m = msg.lower()
@@ -309,18 +376,19 @@ def _is_cuda_fatal_msg(msg: str) -> bool:
         )
     )
 
+
 def _cleanup_cuda_child(torch_mod) -> None:
     gc.collect()
     if getattr(torch_mod, "cuda", None) is None:
         return
     if not torch_mod.cuda.is_available():
         return
-    # After some CUDA faults, these may themselves throw; swallow.
     for fn in (torch_mod.cuda.empty_cache, torch_mod.cuda.ipc_collect):
         try:
             fn()
         except Exception:
             pass
+
 
 def _set_seeds_child(seed: int, torch_mod) -> None:
     random.seed(seed)
@@ -329,24 +397,26 @@ def _set_seeds_child(seed: int, torch_mod) -> None:
     if torch_mod.cuda.is_available():
         torch_mod.cuda.manual_seed_all(seed)
 
+
 def _train_once_child(cfg: TrainingPropConfig, train_json: Path, val_json: Path) -> Dict[str, float]:
     # Child-only imports
     import torch
     from trl import SFTTrainer, SFTConfig
 
-    # Quiet some third-party verbosity (won’t silence Unsloth banners, but helps)
-    try:
-        from transformers.utils import logging as hf_logging
-        hf_logging.set_verbosity_error()
-    except Exception:
-        pass
-    try:
-        from datasets import disable_progress_bar
-        disable_progress_bar()
-        from datasets.utils.logging import set_verbosity_error as ds_set_verbosity_error
-        ds_set_verbosity_error()
-    except Exception:
-        pass
+    # Optional: quiet some HF/Datasets logging (does not silence Unsloth banners)
+    if os.getenv("ATOMGPT_QUIET", "0").lower() in {"1", "true", "yes", "y"}:
+        try:
+            from transformers.utils import logging as hf_logging
+            hf_logging.set_verbosity_error()
+        except Exception:
+            pass
+        try:
+            from datasets import disable_progress_bar
+            disable_progress_bar()
+            from datasets.utils.logging import set_verbosity_error as ds_set_verbosity_error
+            ds_set_verbosity_error()
+        except Exception:
+            pass
 
     model, tok, _ = load_model(path=cfg.model_name, config=cfg)
     if not isinstance(model, PeftModel):
@@ -417,7 +487,7 @@ def _train_once_child(cfg: TrainingPropConfig, train_json: Path, val_json: Path)
         "slope_eval_loss": float(trend_slope(el)),
     }
 
-    # cleanup
+    # Cleanup
     del model, tok, trainer
     _cleanup_cuda_child(torch)
     return metrics
@@ -429,7 +499,7 @@ def _run_child_trial(payload_path: Path, result_path: Path) -> int:
     Return code:
       0 = handled (ok OR handled failure like OOM/cuda_fatal)
       2 = unhandled python exception (parent will mark trial failed)
-    If the process *hard-crashes* (SIGSEGV), parent will see nonzero returncode and/or no result file.
+    If the process hard-crashes (SIGSEGV), parent will see nonzero returncode and/or no result file.
     """
     payload = json.load(open(payload_path))
     cfg_dict = payload["train_cfg"]
@@ -438,13 +508,12 @@ def _run_child_trial(payload_path: Path, result_path: Path) -> int:
     val_json = Path(payload["val_json"])
     seed = int(payload["seed"])
 
-    # child-only import torch
     import torch
 
     cfg = TrainingPropConfig(**cfg_dict)
     _apply_overrides(cfg, overrides)
 
-    # isolate outputs into the provided work_dir
+    # Isolate outputs into the provided work_dir
     work_dir = Path(payload["work_dir"])
     cfg.output_dir = str(work_dir / "out")
     cfg.model_save_path = str(work_dir / "model")
@@ -473,8 +542,6 @@ def _run_child_trial(payload_path: Path, result_path: Path) -> int:
         elif _is_cuda_fatal_msg(msg):
             status = "cuda_fatal"
 
-        # If it’s OOM/cuda_fatal, we *handle* it and exit(0) so parent can return a penalty.
-        # If it’s some other exception, we still write a result file but exit(2) so Optuna can mark FAIL.
         result = {
             "status": status,
             "error": msg,
@@ -490,7 +557,9 @@ def _run_child_trial(payload_path: Path, result_path: Path) -> int:
         return 0 if status in {"oom", "cuda_fatal"} else 2
 
 
-# ───────────────────────── Parent objective ──────────────────────────
+# ---------------------------------------------------------------------
+# Parent objective
+# ---------------------------------------------------------------------
 def objective(
     trial: Trial,
     train_cfg: TrainingPropConfig,
@@ -523,10 +592,9 @@ def objective(
         trial.set_user_attr("failure", "preflight_cap")
         return _penalty_for(cfg, objective_metrics)
 
-    # Helpful “start” line (brief; the child will be chatty)
-    log.info("▶ Trial %02d start | micro=%d  gas=%d  eff=%d", trial.number, micro, gas, eff)
+    # Short start line (child will be chatty)
+    log.info("TRIAL %02d START | micro=%d gas=%d eff=%d", trial.number, micro, gas, eff)
 
-    # Per-trial subprocess sandbox
     work = Path(tempfile.mkdtemp(prefix="optuna_trial_"))
     payload_path = work / "payload.json"
     result_path = work / "result.json"
@@ -554,8 +622,8 @@ def objective(
     try:
         proc = subprocess.run(
             cmd,
-            stdout=None,   # inherit
-            stderr=None,   # inherit
+            stdout=None,  # inherit (stream)
+            stderr=None,  # inherit (stream)
             check=False,
             timeout=trial_timeout_s,
             env=os.environ.copy(),
@@ -600,7 +668,7 @@ def objective(
             trial.set_user_attr("error", res.get("error", ""))
             return _penalty_for(cfg, objective_metrics)
 
-        # Any other python exception: mark trial FAIL but keep study alive via catch=(TrialCrashed,)
+        # Any other python exception: mark trial FAIL but keep the study alive via catch=(TrialCrashed,)
         trial.set_user_attr("failure", status)
         trial.set_user_attr("error", res.get("error", ""))
         raise TrialCrashed(f"Trial {trial.number} failed in subprocess: {status}: {res.get('error','')}")
@@ -608,39 +676,13 @@ def objective(
         shutil.rmtree(work, ignore_errors=True)
 
 
-# ───────────────────────── Trial callback (pretty summaries) ─────────────────────────
-def _make_trial_callback(objective_metrics: List[str]):
-    def _cb(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        # Compact, consistent “good software” summary after each trial
-        msg = _one_line_trial_summary(trial, objective_metrics)
-
-        # For multi-objective, a tiny Pareto indicator helps situational awareness
-        pareto_note = ""
-        if len(study.directions) > 1:
-            pareto_note = f"  |  pareto={len(study.best_trials)}"
-        else:
-            # best_value only meaningful for single objective
-            try:
-                pareto_note = f"  |  best={_fmt_num(study.best_value, nd=4)}"
-            except Exception:
-                pareto_note = ""
-
-        # Print as a tidy block (fast to spot when scrolling)
-        if _PRETTY:
-            lines = msg.splitlines()
-            # append the small note onto the first line if it fits
-            lines[0] = lines[0] + pareto_note
-            out = _box("Trial summary", lines, width=92)
-            log.info("\n%s", out)
-        else:
-            log.info("%s%s", msg, pareto_note)
-    return _cb
-
-
-# ───────────────────────── Main orchestration ────────────────────────
+# ---------------------------------------------------------------------
+# Main orchestration
+# ---------------------------------------------------------------------
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--config_name", help="Path to a TrainingPropConfig JSON")
+
     # Internal: child runner
     p.add_argument("--_run_single_trial", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--payload", type=str, default=None, help=argparse.SUPPRESS)
@@ -673,12 +715,13 @@ def main() -> None:
     if len(directions) == 1 and len(objective_metrics) > 1:
         directions = directions * len(objective_metrics)
 
-    # Banner (human-friendly)
+    obj_desc = ", ".join([f"{m} ({_dir_ascii(d)})" for m, d in zip(objective_metrics, directions)])
     banner_lines = [
         f"trials: {hp_cfg.n_trials}",
-        f"objectives: {', '.join(f'{m} ({'↓' if d=='minimize' else '↑'})' for m, d in zip(objective_metrics, directions))}",
-        f"sampler: TPE(multivariate=True)  |  pruner: MedianPruner(warmup=1)",
-        f"guardrails: micro_bs≤256  eff_bs≤4096  |  child subprocess per trial",
+        f"objectives: {obj_desc}",
+        "sampler: TPE(multivariate=True) | pruner: MedianPruner(warmup=1)",
+        "guardrails: micro_bs<=256  eff_bs<=4096 | child subprocess per trial",
+        "note: per-trial summary shows [x,y,...] <-> [metric names]",
     ]
     log.info("\n%s", _box("AtomGPT Hyperparameter Search", banner_lines, width=92))
 
@@ -708,6 +751,8 @@ def main() -> None:
     )
     study = optuna.create_study(directions=directions, pruner=pruner, sampler=opt_sampler)
 
+    cb = _make_trial_callback(objective_metrics)
+
     wall = time.time()
     try:
         study.optimize(
@@ -719,26 +764,24 @@ def main() -> None:
                 train_json=train_j,
                 val_json=val_j,
                 objective_metrics=objective_metrics,
-                # GUARDS — adjust to taste
                 max_micro_bs=256,
                 max_eff_bs=4096,
                 trial_timeout_s=None,
             ),
             n_trials=hp_cfg.n_trials,
             catch=(TrialCrashed,),
-            callbacks=[_make_trial_callback(objective_metrics)],
+            callbacks=[cb],
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
     runtime = time.time() - wall
 
-    # End summary (also keeps objective labels visible)
     if len(objective_metrics) == 1:
         best = study.best_trial
         lines = [
             f"runtime: {_fmt_num(runtime, nd=2)}s",
-            f"best value: {_fmt_num(best.value, nd=6)}  ↔  [{objective_metrics[0]}]",
+            f"best value: {_fmt_num(best.value, nd=10)} <-> [{objective_metrics[0]}]",
             f"best params: {best.params}",
         ]
         log.info("\n%s", _box("Study finished", lines, width=92))
@@ -746,11 +789,10 @@ def main() -> None:
         lines = [
             f"runtime: {_fmt_num(runtime, nd=2)}s",
             f"pareto size: {len(study.best_trials)}",
-            "top trials (labeled objectives):",
+            "top pareto trials (labeled objectives):",
         ]
-        # show top 5
         for i, t in enumerate(study.best_trials[:5]):
-            vals = ", ".join(f"{m}={_fmt_num(v, nd=6)}" for m, v in zip(objective_metrics, t.values))
+            vals = ", ".join(f"{m}={_fmt_num(v, nd=10)}" for m, v in zip(objective_metrics, t.values))
             lines.append(f"  #{i+1}: {vals} | params={t.params}")
         log.info("\n%s", _box("Study finished", lines, width=92))
 
