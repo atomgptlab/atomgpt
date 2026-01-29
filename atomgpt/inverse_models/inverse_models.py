@@ -1,7 +1,6 @@
 from typing import Optional
 from atomgpt.inverse_models.loader import FastLanguageModel
 
-# from unsloth import FastLanguageModel
 from atomgpt.inverse_models.callbacks import (
     PrintGPUUsageCallback,
     ExampleTrainerCallback,
@@ -36,8 +35,6 @@ from typing import Literal
 import time
 from jarvis.core.composition import Composition
 
-# from atomgpt.inverse_models.custom_trainer import CustomSFTTrainer
-
 parser = argparse.ArgumentParser(
     description="Atomistic Generative Pre-trained Transformer."
 )
@@ -48,7 +45,6 @@ parser.add_argument(
 )
 
 
-# Adapted from https://github.com/unslothai/unsloth
 class TrainingPropConfig(BaseSettings):
     """Training config defaults and validation."""
 
@@ -62,6 +58,7 @@ class TrainingPropConfig(BaseSettings):
     seed_val: int = 3407
     learning_rate: float = 2e-4
     per_device_train_batch_size: int = 2
+    per_device_eval_batch_size: int = 2
     gradient_accumulation_steps: int = 4
     num_train: Optional[int] = None
     num_test: Optional[int] = None
@@ -84,14 +81,16 @@ class TrainingPropConfig(BaseSettings):
     file_format: Literal["poscar", "xyz", "pdb"] = "poscar"
     save_strategy: Literal["epoch", "steps", "no"] = "steps"
     save_steps: int = 2
+    evaluation_strategy: Literal["epoch", "steps", "no"] = "steps"
+    eval_steps: int = 2
+    load_best_model_at_end: bool = False
+    metric_for_best_model: str = "eval_loss"
+    greater_is_better: bool = False
+    save_total_limit: Optional[int] = None
     callback_samples: int = 2
-    max_seq_length: int = (
-        2048  # Choose any! We auto support RoPE Scaling internally!
-    )
+    max_seq_length: int = 2048
     dtype: Optional[str] = None
-    # None for auto detection. Float16 for Tesla T4, V100, Bfloat16 for Ampere+
     load_in_4bit: bool = True
-    # True  # Use 4bit quantization to reduce memory usage. Can be False.
     instruction: str = "Below is a description of a superconductor material."
     alpaca_prompt: str = (
         "### Instruction:\n{}\n### Input:\n{}\n### Output:\n{}"
@@ -99,7 +98,6 @@ class TrainingPropConfig(BaseSettings):
     output_prompt: str = (
         " Generate atomic structure description with lattice lengths, angles, coordinates and atom types."
     )
-    # num_val: Optional[int] = 2
     hp_cfg_path: Optional[str] = "hp_search_config.json"
     per_device_train_batch_size: int = 2
     gradient_accumulation_steps: int = 4
@@ -114,19 +112,19 @@ def get_input(config=None, chem="", val=10):
     elif config.chem_info == "element_list":
         prefix = (
             "The chemical elements are "
-            + chem  # atoms.composition.search_string
+            + chem
             + " . "
         )
     elif config.chem_info == "element_dict":
         prefix = (
             "The chemical contents are "
-            + chem  # atoms.composition.search_string
+            + chem
             + " . "
         )
     elif config.chem_info == "formula":
         prefix = (
             "The chemical formula is "
-            + chem  # atoms.composition.reduced_formula
+            + chem
             + " . "
         )
 
@@ -145,11 +143,7 @@ def get_input(config=None, chem="", val=10):
 def make_alpaca_json(
     dataset=[],
     jids=[],
-    # prop="Tc_supercon",
-    # instruction="",
     include_jid=False,
-    # chem_info="",
-    # output_prompt="",
     config=None,
 ):
     mem = []
@@ -189,7 +183,6 @@ def formatting_prompts_func(examples, alpaca_prompt):
     texts = []
     EOS_TOKEN = "</s>"
     for instruction, input, output in zip(instructions, inputs, outputs):
-        # Must add EOS_TOKEN, otherwise your generation will go on forever!
         text = alpaca_prompt.format(instruction, input, output) + EOS_TOKEN
         texts.append(text)
     return {
@@ -212,6 +205,7 @@ def load_model(path="", config=None):
     FastLanguageModel.for_inference(model)
     return model, tokenizer, config
 
+
 def _validate_atoms(atoms):
     if atoms is None:
         return False, "atoms_is_none"
@@ -229,8 +223,10 @@ def _validate_atoms(atoms):
     except Exception as e:
         return False, f"poscar_fail:{type(e).__name__}:{e}"
 
+
 def _poscar_one_line(at):
     return Poscar(at).to_string().replace("\n", "\\n")
+
 
 def _misses_path(csv_out, config):
     fname = getattr(config, "miss_csv", None)
@@ -239,6 +235,7 @@ def _misses_path(csv_out, config):
         fname = root + ".misses.csv"
     os.makedirs(os.path.dirname(os.path.abspath(fname)), exist_ok=True)
     return fname
+
 
 def evaluate(
     test_set=[],
@@ -270,7 +267,7 @@ def evaluate(
                 target_err = f"text2atoms:{type(e).__name__}:{e}"
 
             if target_err:
-                miss_writer.writerow([sample_id, "target", "invalid_target", target_err, (i.get("output","")[:240])])
+                miss_writer.writerow([sample_id, "target", "invalid_target", target_err, (i.get("output", "")[:240])])
                 continue
 
             gen_mat = None
@@ -303,94 +300,8 @@ def evaluate(
                 miss_writer.writerow([sample_id, "write", "write_failed", f"{type(e).__name__}:{e}", ""])
 
 
-
-def batch_evaluate(
-    test_set=[],
-    prompts=[],
-    model="",
-    tokenizer="",
-    csv_out="out.csv",
-    config="",
-    batch_size=None,
-):
-    gen_atoms = []
-    f = open(csv_out, "w")
-    if not prompts:
-        target_exists = True
-        prompts = [i["input"] for i in test_set]
-        ids = [i["id"] for i in test_set]
-    else:
-        target_exists = False
-        ids = ["id-" + str(i) for i in range(len(prompts))]
-    print("Testing\n", len(prompts))
-    if batch_size is None:
-        batch_size = len(prompts)
-    outputs_decoded = []
-    for batch_start in tqdm(range(0, len(prompts), batch_size)):
-        batch_end = min(batch_start + batch_size, len(prompts))
-        batch_prompts = prompts[batch_start:batch_end]
-        # print("batch_prompts",batch_prompts)
-        # Tokenize and prepare inputs
-        inputs = tokenizer(
-            [
-                config.alpaca_prompt.format(config.instruction, msg, "")
-                for msg in batch_prompts
-            ],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=config.max_seq_length,
-        ).to("cuda")
-
-        # Generate outputs using the model
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=config.max_seq_length,
-            use_cache=True,
-        )
-
-        # Decode outputs
-        outputs_decoded_temp = tokenizer.batch_decode(outputs)
-        # print('outputs_decoded_temp',outputs_decoded_temp)
-        for output in outputs_decoded_temp:
-            outputs_decoded.append(
-                output.replace("<unk>", "")
-                .split("### Output:")[1]
-                .strip("</s>")
-            )
-
-    # print("outputs_decoded", outputs_decoded)
-    f.write("id,target,prediction\n")
-
-    for ii, i in tqdm(enumerate(outputs_decoded), total=len(outputs_decoded)):
-        try:
-            # print("outputs_decoded[ii]",i)
-            atoms = text2atoms(i)
-            gen_mat = Poscar(atoms).to_string().replace("\n", "\\n")
-            gen_atoms.append(atoms.to_dict())
-            if target_exists:
-                target_mat = (
-                    Poscar(text2atoms("\n" + i["output"]))
-                    .to_string()
-                    .replace("\n", "\\n")
-                )
-            else:
-                target_mat = ""
-            # print("target_mat", target_mat)
-            # print("genmat", gen_mat)
-            line = ids[ii] + "," + target_mat + "," + gen_mat + "\n"
-            f.write(line)
-            # print()
-        except Exception as exp:
-            print("Error", exp)
-            pass
-    f.close()
-    return gen_atoms
-
-
 def main(config_file=None):
     if config_file is None:
-
         args = parser.parse_args(sys.argv[1:])
         config_file = args.config_name
     if not torch.cuda.is_available():
@@ -417,16 +328,10 @@ def main(config_file=None):
     run_path = os.path.dirname(id_prop_path)
     num_train = config.num_train
     num_test = config.num_test
-    # model_name = config.model_name
     callback_samples = config.callback_samples
-    # loss_function = config.loss_function
-    # id_prop_path = os.path.join(run_path, id_prop_path)
     with open(id_prop_path, "r") as f:
         reader = csv.reader(f)
         dt = [row for row in reader]
-    if not num_train:
-        num_test = int(len(dt) * config.test_ratio)
-        num_train = len(dt) - num_test
 
     dat = []
     ids = []
@@ -435,20 +340,12 @@ def main(config_file=None):
         info["id"] = i[0]
         ids.append(i[0])
         tmp = [j for j in i[1:]]
-        # tmp = [float(j) for j in i[1:]]
-        # print("tmp", tmp)
         if len(tmp) == 1:
             tmp = str(float(tmp[0]))
         else:
             tmp = config.separator.join(map(str, tmp))
 
-        # if ";" in i[1]:
-        #    tmp = "\n".join([str(round(float(j), 2)) for j in i[1].split(";")])
-        # else:
-        #    tmp = str(round(float(i[1]), 3))
-        info[config.prop] = (
-            tmp  # float(i[1])  # [float(j) for j in i[1:]]  # float(i[1]
-        )
+        info[config.prop] = tmp
         pth = os.path.join(run_path, info["id"])
         if config.file_format == "poscar":
             atoms = Atoms.from_poscar(pth)
@@ -457,16 +354,30 @@ def main(config_file=None):
         elif config.file_format == "cif":
             atoms = Atoms.from_cif(pth)
         elif config.file_format == "pdb":
-            # not tested well
             atoms = Atoms.from_pdb(pth)
         info["atoms"] = atoms.to_dict()
         dat.append(info)
 
+    n_total = len(ids)
+    if num_train is None and num_test is None:
+        num_test = int(n_total * (config.test_ratio or 0.0))
+        num_val = int(n_total * (config.val_ratio or 0.0))
+        num_train = n_total - num_test - num_val
+    else:
+        if num_train is None:
+            num_train = n_total - (num_test or 0)
+        if num_test is None:
+            num_test = max(0, n_total - num_train)
+        num_val = max(0, n_total - num_train - num_test)
+
     train_ids = ids[0:num_train]
+    val_ids = ids[num_train:num_train + num_val]
+    test_ids = ids[num_train + num_val:num_train + num_val + num_test]
+
     print("num_train", num_train)
+    print("num_val", num_val)
     print("num_test", num_test)
-    test_ids = ids[num_train : num_train + num_test]
-    # test_ids = ids[num_train:]
+
     alpaca_prop_train_filename = os.path.join(
         config.output_dir, "alpaca_prop_train.json"
     )
@@ -475,10 +386,6 @@ def main(config_file=None):
             dataset=dat,
             jids=train_ids,
             config=config,
-            # prop=config.property_name,
-            # instruction=config.instruction,
-            # chem_info=config.chem_info,
-            # output_prompt=config.output_prompt,
         )
         dumpjson(data=m_train, filename=alpaca_prop_train_filename)
     else:
@@ -486,41 +393,47 @@ def main(config_file=None):
         m_train = loadjson(alpaca_prop_train_filename)
     print("Sample:\n", m_train[0])
 
+    alpaca_prop_val_filename = os.path.join(
+        config.output_dir, "alpaca_prop_val.json"
+    )
+    if not os.path.exists(alpaca_prop_val_filename):
+        m_val = make_alpaca_json(
+            dataset=dat,
+            jids=val_ids,
+            config=config,
+            include_jid=True,
+        )
+        dumpjson(data=m_val, filename=alpaca_prop_val_filename)
+    else:
+        print(alpaca_prop_val_filename, "exists")
+        m_val = loadjson(alpaca_prop_val_filename)
+
     alpaca_prop_test_filename = os.path.join(
         config.output_dir, "alpaca_prop_test.json"
     )
     if not os.path.exists(alpaca_prop_test_filename):
-
         m_test = make_alpaca_json(
             dataset=dat,
             jids=test_ids,
             config=config,
-            # prop="prop",
             include_jid=True,
-            # instruction=config.instruction,
-            # chem_info=config.chem_info,
-            # output_prompt=config.output_prompt,
         )
         dumpjson(data=m_test, filename=alpaca_prop_test_filename)
     else:
         print(alpaca_prop_test_filename, "exists")
         m_test = loadjson(alpaca_prop_test_filename)
 
-    # 4bit pre quantized models we support for 4x faster downloading + no OOMs.
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=config.model_name,  # Choose ANY! eg teknium/OpenHermes-2.5-Mistral-7B
+        model_name=config.model_name,
         max_seq_length=config.max_seq_length,
         dtype=config.dtype,
         load_in_4bit=config.load_in_4bit,
-        # token = "hf_...", # use one if using gated models like meta-llama/Llama-2-7b-hf
     )
     if not isinstance(model, PeftModel):
-        # import sys
         print("Not Peft model")
-        # sys.exit()
         model = FastLanguageModel.get_peft_model(
             model,
-            r=config.lora_rank,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+            r=config.lora_rank,
             target_modules=[
                 "q_proj",
                 "k_proj",
@@ -531,29 +444,32 @@ def main(config_file=None):
                 "down_proj",
             ],
             lora_alpha=config.lora_alpha,
-            lora_dropout=0,  # Supports any, but = 0 is optimized
-            bias="none",  # Supports any, but = "none" is optimized
+            lora_dropout=0,
+            bias="none",
             use_gradient_checkpointing=True,
             random_state=3407,
-            use_rslora=False,  # We support rank stabilized LoRA
-            loftq_config=None,  # And LoftQ
+            use_rslora=False,
+            loftq_config=None,
         )
 
-    EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
-    # tokenizer.pad_token_id = tokenizer.eos_token_id
-    # model.resize_token_embeddings(len(tokenizer))
+    EOS_TOKEN = tokenizer.eos_token
+
     train_dataset = load_dataset(
         "json",
         data_files=alpaca_prop_train_filename,
         split="train",
-        # "json", data_files="alpaca_prop_train.json", split="train"
     )
-    eval_dataset = load_dataset(
+    val_dataset = load_dataset(
+        "json",
+        data_files=alpaca_prop_val_filename,
+        split="train",
+    )
+    test_dataset = load_dataset(
         "json",
         data_files=alpaca_prop_test_filename,
         split="train",
-        # "json", data_files="alpaca_prop_train.json", split="train"
     )
+
     formatting_prompts_func_with_prompt = partial(
         formatting_prompts_func, alpaca_prompt=config.alpaca_prompt
     )
@@ -571,78 +487,48 @@ def main(config_file=None):
         batched=True,
         num_proc=config.dataset_num_proc
     )
-    eval_dataset = eval_dataset.map(
+    val_dataset = val_dataset.map(
         formatting_prompts_func_with_prompt,
         batched=True,
         num_proc=config.dataset_num_proc
     )
-    # Compute the actual max sequence length in raw text
+    test_dataset = test_dataset.map(
+        formatting_prompts_func_with_prompt,
+        batched=True,
+        num_proc=config.dataset_num_proc
+    )
+
     lengths = [
         len(tokenizer(example["text"], truncation=False)["input_ids"])
-        for example in eval_dataset
+        for example in val_dataset
     ]
-    max_seq_length = max(lengths)
-    print(f"🧠 Suggested max_seq_length based on dataset: {max_seq_length}")
+    if lengths:
+        max_seq_length = max(lengths)
+        print(f"🧠 Suggested max_seq_length based on dataset: {max_seq_length}")
 
     tokenized_train = train_dataset.map(tokenize_function, batched=True, num_proc=config.dataset_num_proc)
-    tokenized_eval = eval_dataset.map(tokenize_function, batched=True, num_proc=config.dataset_num_proc)
+    tokenized_val = val_dataset.map(tokenize_function, batched=True, num_proc=config.dataset_num_proc)
     tokenized_train.set_format(
-        type="torch", columns=["input_ids", "attention_mask", "output"]
+        type="torch", columns=["input_ids", "attention_mask"]
     )
-    tokenized_eval.set_format(
-        type="torch", columns=["input_ids", "attention_mask", "output"]
+    tokenized_val.set_format(
+        type="torch", columns=["input_ids", "attention_mask"]
     )
 
-    """
     trainer = SFTTrainer(
-        # trainer = CustomSFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=tokenized_train,
-        eval_dataset=tokenized_eval,
-        # train_dataset=dataset,
-        dataset_text_field="text",
-        max_seq_length=config.max_seq_length,
-        dataset_num_proc=config.dataset_num_proc,
-        # loss_type=config.loss_type,
-        packing=False,  # Can make training 5x faster for short sequences.
-        args=TrainingArguments(
-            per_device_train_batch_size=config.per_device_train_batch_size,
-            gradient_accumulation_steps=config.gradient_accumulation_steps,
-            warmup_steps=5,
-            overwrite_output_dir=True,
-            save_strategy=config.save_strategy,
-            save_steps=config.save_steps,
-            # max_steps = 60,
-            learning_rate=config.learning_rate,
-            fp16=not torch.cuda.is_bf16_supported(),
-            bf16=torch.cuda.is_bf16_supported(),
-            logging_steps=config.logging_steps,
-            optim=config.optim,
-            weight_decay=0.01,
-            lr_scheduler_type=config.lr_scheduler_type,  # "linear",
-            seed=config.seed_val,
-            output_dir=config.output_dir,
-            num_train_epochs=config.num_epochs,
-            report_to="none",
-        ),
-    )
-    """
-
-    trainer = SFTTrainer(
-        model=model,
-        train_dataset=tokenized_train,
-        # train_dataset = train_dataset,
-        # tokenizer = tokenizer,
+        eval_dataset=tokenized_val,
         args=SFTConfig(
             dataset_text_field="text",
             max_seq_length=config.max_seq_length,
             per_device_train_batch_size=config.per_device_train_batch_size,
+            per_device_eval_batch_size=config.per_device_eval_batch_size,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
             warmup_steps=config.warmup_steps,
             overwrite_output_dir=True,
             warmup_ratio=config.warmup_ratio,
-            # max_steps=60,
             logging_steps=config.logging_steps,
             output_dir=config.output_dir,
             optim=config.optim,
@@ -650,12 +536,19 @@ def main(config_file=None):
             num_train_epochs=config.num_epochs,
             save_strategy=config.save_strategy,
             save_steps=config.save_steps,
+            evaluation_strategy=config.evaluation_strategy,
+            eval_steps=config.eval_steps,
+            load_best_model_at_end=config.load_best_model_at_end,
+            metric_for_best_model=config.metric_for_best_model,
+            greater_is_better=config.greater_is_better,
+            save_total_limit=config.save_total_limit,
+            report_to="none",
         ),
     )
+
     if callback_samples > 0:
         callback = ExampleTrainerCallback(
-            some_tokenized_dataset=tokenized_eval,
-            # some_tokenized_dataset=tokenized_eval,
+            some_tokenized_dataset=tokenized_val,
             tokenizer=tokenizer,
             max_length=config.max_seq_length,
             callback_samples=callback_samples,
@@ -665,34 +558,10 @@ def main(config_file=None):
     trainer.add_callback(gpu_usage)
     trainer_stats = trainer.train()
     trainer.save_model(config.model_save_path)
-    # model.save_pretrained(config.model_save_path)
 
-    # model, tokenizer = FastLanguageModel.from_pretrained(
-    #    model_name=config.model_save_path,  # YOUR MODEL YOU USED FOR TRAINING
-    #    max_seq_length=config.max_seq_length,
-    #    dtype=config.dtype,
-    #    load_in_4bit=config.load_in_4bit,
-    # )
     model = trainer.model
-    FastLanguageModel.for_inference(model)  # Enable native 2x faster inference
-    # model, tokenizer, config = load_model(path=config.model_save_path)
-    # batch_evaluate(
-    #   prompts=[i["input"] for i in m_test],
-    #   model=model,
-    #   tokenizer=tokenizer,
-    #   csv_out=config.csv_out,
-    #   config=config,
-    # )
-    # t1 = time.time()
-    # batch_evaluate(
-    #    test_set=m_test,
-    #    model=model,
-    #    tokenizer=tokenizer,
-    #    csv_out=config.csv_out,
-    #    config=config,
-    # )
-    # t2 = time.time()
-    # t1a = time.time()
+    FastLanguageModel.for_inference(model)
+
     evaluate(
         test_set=m_test,
         model=model,
@@ -705,10 +574,5 @@ def main(config_file=None):
 
 
 if __name__ == "__main__":
-    # output_dir = make_id_prop()
-    # output_dir="."
     args = parser.parse_args(sys.argv[1:])
     main(config_file=args.config_name)
-    #    config_file="config.json"
-    # )
-    # x=load_model(path="/wrk/knc6/Software/atomgpt_opt/atomgpt/lora_model_m/")
