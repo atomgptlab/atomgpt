@@ -1,11 +1,5 @@
 #!/usr/bin/env python
-# hyperparameter_search.py  (subprocess-per-trial, with preflight guards)
-#
-# Console UX upgrades:
-#  - Clean “banner” + per-trial one-line summaries
-#  - Reiterate objective metric names after each trial (values ↔ labels)
-#  - Elegant, low-noise Optuna logging (keeps failures visible)
-#  - Quick-scan formatting: micro_bs / GAS / eff_batch / objectives / key metrics
+# hyperparameter_search.py
 
 from __future__ import annotations
 
