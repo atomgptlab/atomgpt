@@ -104,11 +104,25 @@ def _is_oom(e: BaseException) -> bool:
     )
 
 
+def _is_cuda_fatal(e: BaseException) -> bool:
+    msg = str(e).lower()
+    return (
+        "illegal memory access" in msg
+        or "device-side assert" in msg
+        or "unspecified launch failure" in msg
+        or "misaligned address" in msg
+        or "an illegal instruction was encountered" in msg
+    )
+
+
 def _cleanup_cuda():
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        for fn in (torch.cuda.empty_cache, torch.cuda.ipc_collect):
+            try:
+                fn()
+            except Exception:
+                pass
 
 
 # ═════════════════════ Search-space sampler ══════════════════════════
@@ -329,7 +343,7 @@ def objective(
             try:
                 metrics_avgs.append(_train_once(cfg, train_json, val_json, prune_cb))
             except Exception as e:
-                if _is_oom(e):
+                if _is_oom(e) or _is_cuda_fatal(e):
                     eff = int(cfg.per_device_train_batch_size) * int(cfg.gradient_accumulation_steps)
                     trial.set_user_attr("oom_violation", 1.0)
                     trial.set_user_attr("effective_batch", eff)
@@ -337,6 +351,7 @@ def objective(
                     penalty = 1e9 + 1e6 * eff
                     return penalty if len(objective_metrics) == 1 else tuple([penalty] * len(objective_metrics))
                 raise
+
 
         metrics = {
             k: float(np.mean([d[k] for d in metrics_avgs])) for k in metrics_avgs[0]
