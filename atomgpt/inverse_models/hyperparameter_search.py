@@ -522,4 +522,86 @@ def main() -> None:
 
     # Parent mode
     if not args.config_name:
-        raise System
+        raise SystemExit("--config_name is required")
+
+    train_cfg = TrainingPropConfig(**json.load(open(args.config_name)))
+    hp_cfg = OptunaSearchConfig(**json.load(open(train_cfg.hp_cfg_path)))
+
+    obj = hp_cfg.objective_metric or "final_eval_loss"
+    objective_metrics = [obj] if isinstance(obj, str) else list(obj)
+
+    dirs = hp_cfg.study_direction
+    if dirs is None:
+        directions = [_auto_direction(k) for k in objective_metrics]
+    else:
+        directions = [dirs] if isinstance(dirs, str) else list(dirs)
+
+    if len(directions) == 1 and len(objective_metrics) > 1:
+        directions = directions * len(objective_metrics)
+
+    if _DEBUG:
+        log.debug("Objectives: %s | Directions: %s", objective_metrics, directions)
+
+    # Build dataset JSONs once (shared across trials)
+    data = _load_id_prop_data(train_cfg.id_prop_path, train_cfg)
+
+    train_ids, val_ids, test_ids = train_val_test_split_ids(
+        data,
+        train_cfg.id_tag,
+        train_cfg.seed_val,
+        train_cfg.val_ratio,
+        train_cfg.test_ratio,
+    )
+
+    tmp = Path(tempfile.mkdtemp(prefix="optuna_data_"))
+    train_j = tmp / "train.json"
+    val_j = tmp / "val.json"
+    test_j = tmp / "test.json"
+    dumpjson(make_alpaca_json(data, train_ids, config=train_cfg), train_j)
+    dumpjson(make_alpaca_json(data, val_ids, config=train_cfg), val_j)
+    dumpjson(make_alpaca_json(data, test_ids, config=train_cfg), test_j)
+
+    sampler = SearchSpaceSampler(hp_cfg.parameters)
+    pruner = optuna.pruners.MedianPruner(n_warmup_steps=1)
+    opt_sampler = TPESampler(
+        multivariate=True,
+        constraints_func=lambda t: (t.user_attrs.get("oom_violation", 0.0),),
+    )
+    study = optuna.create_study(directions=directions, pruner=pruner, sampler=opt_sampler)
+
+    wall = time.time()
+    try:
+        study.optimize(
+            partial(
+                objective,
+                train_cfg=train_cfg,
+                hp_cfg=hp_cfg,
+                sampler=sampler,
+                train_json=train_j,
+                val_json=val_j,
+                objective_metrics=objective_metrics,
+                # GUARDS — adjust to taste
+                max_micro_bs=256,
+                max_eff_bs=4096,
+                trial_timeout_s=None,
+            ),
+            n_trials=hp_cfg.n_trials,
+            # CRITICAL: this keeps the *study* alive while marking the trial FAIL (visible)
+            catch=(TrialCrashed,),
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    runtime = time.time() - wall
+    print(f"\nStudy finished in {runtime:.1f}s")
+    if len(objective_metrics) == 1:
+        print("Best value :", study.best_value)
+        print("Best params:", study.best_params)
+    else:
+        print("Pareto front (top 5 shown):")
+        for i, t in enumerate(study.best_trials[:5]):
+            print(f"  Trial {t.number}: values={t.values}, params={t.params}")
+
+
+if __name__ == "__main__":
+    main()
