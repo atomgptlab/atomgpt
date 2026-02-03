@@ -147,6 +147,7 @@ class TrainingPropConfig(BaseSettings):
     evaluation_strategy: Literal["epoch", "steps", "no"] = "steps"
     eval_steps: int = 2
     report_to: str = "none"
+    tokenizer_class: Optional[str] = "none"
 
 
 def get_input(config=None, chem="", val=10):
