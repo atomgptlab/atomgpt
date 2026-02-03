@@ -18,7 +18,7 @@ from atomgpt.inverse_models.utils import (
 )
 from trl import SFTTrainer, SFTConfig
 from peft import PeftModel
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from functools import partial
 from jarvis.core.atoms import Atoms
 from jarvis.db.jsonutils import loadjson, dumpjson
@@ -46,6 +46,43 @@ parser.add_argument(
     default="alignn/examples/sample_data/config_example.json",
     help="Name of the config file",
 )
+
+
+def _detect_presharded_root(id_prop_path: str, config) -> Optional[str]:
+    """
+    Detect a presharded HF dataset saved by preshard_dataset.py in the directory
+    containing id_prop.csv (or a subdirectory of it). We look for:
+        <candidate>/alpaca/dataset_dict.json
+    """
+    base_dir = os.path.dirname(os.path.abspath(id_prop_path))
+    candidates = []
+
+    tok_cls = getattr(config, "tokenizer_class", None)
+    if tok_cls:
+        candidates.append(os.path.join(base_dir, str(tok_cls)))
+
+    candidates.append(base_dir)
+
+    try:
+        for name in sorted(os.listdir(base_dir)):
+            p = os.path.join(base_dir, name)
+            if os.path.isdir(p):
+                candidates.append(p)
+    except Exception:
+        pass
+
+    seen = set()
+    for root in candidates:
+        if root in seen:
+            continue
+        seen.add(root)
+        alpaca_dir = os.path.join(root, "alpaca")
+        if os.path.isdir(alpaca_dir) and os.path.exists(
+            os.path.join(alpaca_dir, "dataset_dict.json")
+        ):
+            return root
+
+    return None
 
 
 # Adapted from https://github.com/unslothai/unsloth
@@ -216,6 +253,7 @@ def load_model(path="", config=None):
     FastLanguageModel.for_inference(model)
     return model, tokenizer, config
 
+
 def _validate_atoms(atoms):
     if atoms is None:
         return False, "atoms_is_none"
@@ -233,8 +271,10 @@ def _validate_atoms(atoms):
     except Exception as e:
         return False, f"poscar_fail:{type(e).__name__}:{e}"
 
+
 def _poscar_one_line(at):
     return Poscar(at).to_string().replace("\n", "\\n")
+
 
 def _misses_path(csv_out, config):
     fname = getattr(config, "miss_csv", None)
@@ -243,6 +283,7 @@ def _misses_path(csv_out, config):
         fname = root + ".misses.csv"
     os.makedirs(os.path.dirname(os.path.abspath(fname)), exist_ok=True)
     return fname
+
 
 def evaluate(
     test_set=[],
@@ -255,11 +296,15 @@ def evaluate(
     os.makedirs(os.path.dirname(os.path.abspath(csv_out)), exist_ok=True)
     miss_csv_out = _misses_path(csv_out, config)
 
-    with open(csv_out, "w", newline="") as f_ok, open(miss_csv_out, "w", newline="") as f_miss:
+    with open(csv_out, "w", newline="") as f_ok, open(
+        miss_csv_out, "w", newline=""
+    ) as f_miss:
         ok_writer = csv.writer(f_ok)
         miss_writer = csv.writer(f_miss)
         ok_writer.writerow(["id", "target", "prediction"])
-        miss_writer.writerow(["id", "stage", "error", "detail", "raw_text_preview"])
+        miss_writer.writerow(
+            ["id", "stage", "error", "detail", "raw_text_preview"]
+        )
 
         for i in tqdm(test_set, total=len(test_set)):
             sample_id = i.get("id", "")
@@ -274,7 +319,15 @@ def evaluate(
                 target_err = f"text2atoms:{type(e).__name__}:{e}"
 
             if target_err:
-                miss_writer.writerow([sample_id, "target", "invalid_target", target_err, (i.get("output","")[:240])])
+                miss_writer.writerow(
+                    [
+                        sample_id,
+                        "target",
+                        "invalid_target",
+                        target_err,
+                        (i.get("output", "")[:240]),
+                    ]
+                )
                 continue
 
             gen_mat = None
@@ -294,18 +347,29 @@ def evaluate(
                 gen_err = f"gen_atoms:{type(e).__name__}:{e}"
 
             if gen_err:
-                miss_writer.writerow([sample_id, "prediction", "invalid_prediction", gen_err, ""])
+                miss_writer.writerow(
+                    [sample_id, "prediction", "invalid_prediction", gen_err, ""]
+                )
                 continue
 
             try:
-                ok_writer.writerow([
-                    sample_id,
-                    _poscar_one_line(target_mat),
-                    _poscar_one_line(gen_mat),
-                ])
+                ok_writer.writerow(
+                    [
+                        sample_id,
+                        _poscar_one_line(target_mat),
+                        _poscar_one_line(gen_mat),
+                    ]
+                )
             except Exception as e:
-                miss_writer.writerow([sample_id, "write", "write_failed", f"{type(e).__name__}:{e}", ""])
-
+                miss_writer.writerow(
+                    [
+                        sample_id,
+                        "write",
+                        "write_failed",
+                        f"{type(e).__name__}:{e}",
+                        "",
+                    ]
+                )
 
 
 def batch_evaluate(
@@ -425,121 +489,148 @@ def main(config_file=None):
     callback_samples = config.callback_samples
     # loss_function = config.loss_function
     # id_prop_path = os.path.join(run_path, id_prop_path)
-    with open(id_prop_path, "r") as f:
-        reader = csv.reader(f)
-        dt = [row for row in reader]
-    if not num_train:
-        n_all = len(dt)
-        num_test = int(n_all * (config.test_ratio or 0.0))
-        num_val = int(n_all * (config.val_ratio or 0.0))
-        if num_val <= 0 and (config.val_ratio or 0.0) > 0 and num_test > 0:
-            num_val = 1
-            num_test = max(0, num_test - 1)
-        num_train = n_all - num_test - num_val
+    preshard_root = _detect_presharded_root(id_prop_path, config)
+    use_presharded = preshard_root is not None
 
-    dat = []
-    ids = []
-    for i in tqdm(dt, total=len(dt)):
-        info = {}
-        info["id"] = i[0]
-        ids.append(i[0])
-        tmp = [j for j in i[1:]]
-        # tmp = [float(j) for j in i[1:]]
-        # print("tmp", tmp)
-        if len(tmp) == 1:
-            tmp = str(float(tmp[0]))
+    if use_presharded:
+        print("Using presharded dataset:", preshard_root)
+        ds_alpaca = load_from_disk(os.path.join(preshard_root, "alpaca"))
+        train_dataset = ds_alpaca["train"]
+        if "validation" in ds_alpaca and len(ds_alpaca["validation"]) > 0:
+            eval_dataset = ds_alpaca["validation"]
         else:
-            tmp = config.separator.join(map(str, tmp))
-
-        # if ";" in i[1]:
-        #    tmp = "\n".join([str(round(float(j), 2)) for j in i[1].split(";")])
-        # else:
-        #    tmp = str(round(float(i[1]), 3))
-        info[config.prop] = (
-            tmp  # float(i[1])  # [float(j) for j in i[1:]]  # float(i[1]
-        )
-        pth = os.path.join(run_path, info["id"])
-        if config.file_format == "poscar":
-            atoms = Atoms.from_poscar(pth)
-        elif config.file_format == "xyz":
-            atoms = Atoms.from_xyz(pth)
-        elif config.file_format == "cif":
-            atoms = Atoms.from_cif(pth)
-        elif config.file_format == "pdb":
-            # not tested well
-            atoms = Atoms.from_pdb(pth)
-        info["atoms"] = atoms.to_dict()
-        dat.append(info)
-
-    n_all = len(ids)
-    num_val = int(n_all * (config.val_ratio or 0.0))
-    if num_val <= 0 and (config.val_ratio or 0.0) > 0 and (num_test or 0) > 0:
-        num_val = 1
-        num_test = max(0, int(n_all * (config.test_ratio or 0.0)) - 1)
-    if num_train is None or num_train <= 0:
-        num_train = n_all - (num_test or 0) - num_val
-
-    train_ids = ids[0:num_train]
-    print("num_train", num_train)
-    print("num_test", num_test)
-    print("num_val", num_val)
-    val_ids = ids[num_train : num_train + num_val]
-    test_ids = ids[num_train + num_val : num_train + num_val + (num_test or 0)]
-    # test_ids = ids[num_train:]
-
-    alpaca_prop_train_filename = os.path.join(
-        config.output_dir, "alpaca_prop_train.json"
-    )
-    if not os.path.exists(alpaca_prop_train_filename):
-        m_train = make_alpaca_json(
-            dataset=dat,
-            jids=train_ids,
-            config=config,
-            # prop=config.property_name,
-            # instruction=config.instruction,
-            # chem_info=config.chem_info,
-            # output_prompt=config.output_prompt,
-        )
-        dumpjson(data=m_train, filename=alpaca_prop_train_filename)
+            eval_dataset = ds_alpaca["test"]
+        m_test = ds_alpaca["test"] if "test" in ds_alpaca else eval_dataset
+        print("Sample:\n", train_dataset[0])
     else:
-        print(alpaca_prop_train_filename, " exists")
-        m_train = loadjson(alpaca_prop_train_filename)
-    print("Sample:\n", m_train[0])
+        with open(id_prop_path, "r") as f:
+            reader = csv.reader(f)
+            dt = [row for row in reader]
+        if not num_train:
+            n_all = len(dt)
+            num_test = int(n_all * (config.test_ratio or 0.0))
+            num_val = int(n_all * (config.val_ratio or 0.0))
+            if (
+                num_val <= 0
+                and (config.val_ratio or 0.0) > 0
+                and num_test > 0
+            ):
+                num_val = 1
+                num_test = max(0, num_test - 1)
+            num_train = n_all - num_test - num_val
 
-    alpaca_prop_val_filename = os.path.join(
-        config.output_dir, "alpaca_prop_val.json"
-    )
-    if not os.path.exists(alpaca_prop_val_filename):
-        m_val = make_alpaca_json(
-            dataset=dat,
-            jids=val_ids,
-            config=config,
-            include_jid=True,
+        dat = []
+        ids = []
+        for i in tqdm(dt, total=len(dt)):
+            info = {}
+            info["id"] = i[0]
+            ids.append(i[0])
+            tmp = [j for j in i[1:]]
+            # tmp = [float(j) for j in i[1:]]
+            # print("tmp", tmp)
+            if len(tmp) == 1:
+                tmp = str(float(tmp[0]))
+            else:
+                tmp = config.separator.join(map(str, tmp))
+
+            # if ";" in i[1]:
+            #    tmp = "\n".join([str(round(float(j), 2)) for j in i[1].split(";")])
+            # else:
+            #    tmp = str(round(float(i[1]), 3))
+            info[config.prop] = (
+                tmp  # float(i[1])  # [float(j) for j in i[1:]]  # float(i[1]
+            )
+            pth = os.path.join(run_path, info["id"])
+            if config.file_format == "poscar":
+                atoms = Atoms.from_poscar(pth)
+            elif config.file_format == "xyz":
+                atoms = Atoms.from_xyz(pth)
+            elif config.file_format == "cif":
+                atoms = Atoms.from_cif(pth)
+            elif config.file_format == "pdb":
+                # not tested well
+                atoms = Atoms.from_pdb(pth)
+            info["atoms"] = atoms.to_dict()
+            dat.append(info)
+
+        n_all = len(ids)
+        num_val = int(n_all * (config.val_ratio or 0.0))
+        if (
+            num_val <= 0
+            and (config.val_ratio or 0.0) > 0
+            and (num_test or 0) > 0
+        ):
+            num_val = 1
+            num_test = max(0, int(n_all * (config.test_ratio or 0.0)) - 1)
+        if num_train is None or num_train <= 0:
+            num_train = n_all - (num_test or 0) - num_val
+
+        train_ids = ids[0:num_train]
+        print("num_train", num_train)
+        print("num_test", num_test)
+        print("num_val", num_val)
+        val_ids = ids[num_train : num_train + num_val]
+        test_ids = ids[
+            num_train
+            + num_val : num_train
+            + num_val
+            + (num_test or 0)
+        ]
+        # test_ids = ids[num_train:]
+
+        alpaca_prop_train_filename = os.path.join(
+            config.output_dir, "alpaca_prop_train.json"
         )
-        dumpjson(data=m_val, filename=alpaca_prop_val_filename)
-    else:
-        print(alpaca_prop_val_filename, "exists")
-        m_val = loadjson(alpaca_prop_val_filename)
+        if not os.path.exists(alpaca_prop_train_filename):
+            m_train = make_alpaca_json(
+                dataset=dat,
+                jids=train_ids,
+                config=config,
+                # prop=config.property_name,
+                # instruction=config.instruction,
+                # chem_info=config.chem_info,
+                # output_prompt=config.output_prompt,
+            )
+            dumpjson(data=m_train, filename=alpaca_prop_train_filename)
+        else:
+            print(alpaca_prop_train_filename, " exists")
+            m_train = loadjson(alpaca_prop_train_filename)
+        print("Sample:\n", m_train[0])
 
-    alpaca_prop_test_filename = os.path.join(
-        config.output_dir, "alpaca_prop_test.json"
-    )
-    if not os.path.exists(alpaca_prop_test_filename):
-
-        m_test = make_alpaca_json(
-            dataset=dat,
-            jids=test_ids,
-            config=config,
-            # prop="prop",
-            include_jid=True,
-            # instruction=config.instruction,
-            # chem_info=config.chem_info,
-            # output_prompt=config.output_prompt,
+        alpaca_prop_val_filename = os.path.join(
+            config.output_dir, "alpaca_prop_val.json"
         )
-        dumpjson(data=m_test, filename=alpaca_prop_test_filename)
-    else:
-        print(alpaca_prop_test_filename, "exists")
-        m_test = loadjson(alpaca_prop_test_filename)
+        if not os.path.exists(alpaca_prop_val_filename):
+            m_val = make_alpaca_json(
+                dataset=dat,
+                jids=val_ids,
+                config=config,
+                include_jid=True,
+            )
+            dumpjson(data=m_val, filename=alpaca_prop_val_filename)
+        else:
+            print(alpaca_prop_val_filename, "exists")
+            m_val = loadjson(alpaca_prop_val_filename)
+
+        alpaca_prop_test_filename = os.path.join(
+            config.output_dir, "alpaca_prop_test.json"
+        )
+        if not os.path.exists(alpaca_prop_test_filename):
+
+            m_test = make_alpaca_json(
+                dataset=dat,
+                jids=test_ids,
+                config=config,
+                # prop="prop",
+                include_jid=True,
+                # instruction=config.instruction,
+                # chem_info=config.chem_info,
+                # output_prompt=config.output_prompt,
+            )
+            dumpjson(data=m_test, filename=alpaca_prop_test_filename)
+        else:
+            print(alpaca_prop_test_filename, "exists")
+            m_test = loadjson(alpaca_prop_test_filename)
 
     # 4bit pre quantized models we support for 4x faster downloading + no OOMs.
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -577,18 +668,23 @@ def main(config_file=None):
     EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
     # tokenizer.pad_token_id = tokenizer.eos_token_id
     # model.resize_token_embeddings(len(tokenizer))
-    train_dataset = load_dataset(
-        "json",
-        data_files=alpaca_prop_train_filename,
-        split="train",
-        # "json", data_files="alpaca_prop_train.json", split="train"
-    )
-    eval_dataset = load_dataset(
-        "json",
-        data_files=alpaca_prop_val_filename if len(val_ids) > 0 else alpaca_prop_test_filename,
-        split="train",
-        # "json", data_files="alpaca_prop_train.json", split="train"
-    )
+
+    if not use_presharded:
+        train_dataset = load_dataset(
+            "json",
+            data_files=alpaca_prop_train_filename,
+            split="train",
+            # "json", data_files="alpaca_prop_train.json", split="train"
+        )
+        eval_dataset = load_dataset(
+            "json",
+            data_files=alpaca_prop_val_filename
+            if len(val_ids) > 0
+            else alpaca_prop_test_filename,
+            split="train",
+            # "json", data_files="alpaca_prop_train.json", split="train"
+        )
+
     formatting_prompts_func_with_prompt = partial(
         formatting_prompts_func, alpaca_prompt=config.alpaca_prompt
     )
@@ -604,12 +700,12 @@ def main(config_file=None):
     train_dataset = train_dataset.map(
         formatting_prompts_func_with_prompt,
         batched=True,
-        num_proc=config.dataset_num_proc
+        num_proc=config.dataset_num_proc,
     )
     eval_dataset = eval_dataset.map(
         formatting_prompts_func_with_prompt,
         batched=True,
-        num_proc=config.dataset_num_proc
+        num_proc=config.dataset_num_proc,
     )
     # Compute the actual max sequence length in raw text
     lengths = [
@@ -619,8 +715,12 @@ def main(config_file=None):
     max_seq_length = max(lengths)
     print(f"🧠 Suggested max_seq_length based on dataset: {max_seq_length}")
 
-    tokenized_train = train_dataset.map(tokenize_function, batched=True, num_proc=config.dataset_num_proc)
-    tokenized_eval = eval_dataset.map(tokenize_function, batched=True, num_proc=config.dataset_num_proc)
+    tokenized_train = train_dataset.map(
+        tokenize_function, batched=True, num_proc=config.dataset_num_proc
+    )
+    tokenized_eval = eval_dataset.map(
+        tokenize_function, batched=True, num_proc=config.dataset_num_proc
+    )
     tokenized_train.set_format(
         type="torch", columns=["input_ids", "attention_mask", "output"]
     )
