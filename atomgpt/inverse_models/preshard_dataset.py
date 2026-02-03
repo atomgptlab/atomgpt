@@ -7,6 +7,8 @@ import os
 import time
 from typing import Optional, Literal
 
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
+
 from datasets import load_dataset
 from pydantic import BaseModel
 from tqdm import tqdm
@@ -169,6 +171,36 @@ class _ShardWriter:
             self._fh = None
 
 
+# ---- multiprocessing worker plumbing (added) ----
+_WORKER_CFG = None
+_WORKER_RUN_PATH = None
+_WORKER_EOS = None
+
+
+def _worker_init(raw_cfg: dict, run_path: str, eos_token: str):
+    global _WORKER_CFG, _WORKER_RUN_PATH, _WORKER_EOS
+    _WORKER_CFG = TrainingPropConfig(**raw_cfg)
+    _WORKER_RUN_PATH = run_path
+    _WORKER_EOS = eos_token
+
+
+def _build_record_worker(jid: str, prop_val: str) -> dict:
+    cfg = _WORKER_CFG
+    atoms = _atoms_from_file(_WORKER_RUN_PATH, jid, cfg.file_format)
+    chem = _chem_string(cfg, atoms)
+    inp = get_input(config=cfg, chem=chem, val=prop_val)
+    out = get_crystal_string_t(atoms)
+    text = cfg.alpaca_prompt.format(cfg.instruction, inp, out) + _WORKER_EOS
+    return {
+        "id": jid,
+        "instruction": cfg.instruction,
+        "input": inp,
+        "output": out,
+        "text": text,
+    }
+# -----------------------------------------------
+
+
 def main(config_file=None):
     if config_file is None:
         args = parser.parse_args()
@@ -234,43 +266,118 @@ def main(config_file=None):
     w_test = _ShardWriter(pretok_dir, "test", records_per_shard=records_per_shard)
 
     EOS_TOKEN = "</s>"
+    n_target = num_train + num_val + num_test
+
+    # choose record-building workers from Slurm/env (added)
+    record_num_proc = int(
+        os.environ.get(
+            "PRETOK_RECORD_NUM_PROC",
+            os.environ.get("SLURM_CPUS_PER_TASK", "1"),
+        )
+    )
+    if record_num_proc < 1:
+        record_num_proc = 1
+    max_in_flight = int(os.environ.get("PRETOK_MAX_INFLIGHT", str(record_num_proc * 4)))
 
     try:
         with open(id_prop_path, "r") as f:
             reader = csv.reader(f)
-            for idx, row in enumerate(tqdm(reader, total=n_all)):
-                if not row:
-                    continue
-                jid = row[0]
 
-                if idx < num_train:
-                    writer = w_train
-                elif idx < num_train + num_val:
-                    writer = w_val
-                elif idx < num_train + num_val + num_test:
-                    writer = w_test
-                else:
-                    break
+            if record_num_proc <= 1:
+                # original serial behavior
+                for idx, row in enumerate(tqdm(reader, total=n_all)):
+                    if idx >= n_target:
+                        break
+                    if not row:
+                        continue
+                    jid = row[0]
 
-                prop_val = _parse_prop(row, separator=cfg.separator)
-                if str(prop_val).strip().lower() == "na":
-                    continue
+                    if idx < num_train:
+                        writer = w_train
+                    elif idx < num_train + num_val:
+                        writer = w_val
+                    elif idx < num_train + num_val + num_test:
+                        writer = w_test
+                    else:
+                        break
 
-                atoms = _atoms_from_file(run_path, jid, cfg.file_format)
-                chem = _chem_string(cfg, atoms)
-                inp = get_input(config=cfg, chem=chem, val=prop_val)
-                out = get_crystal_string_t(atoms)
-                text = cfg.alpaca_prompt.format(cfg.instruction, inp, out) + EOS_TOKEN
+                    prop_val = _parse_prop(row, separator=cfg.separator)
+                    if str(prop_val).strip().lower() == "na":
+                        continue
 
-                writer.write(
-                    {
-                        "id": jid,
-                        "instruction": cfg.instruction,
-                        "input": inp,
-                        "output": out,
-                        "text": text,
-                    }
-                )
+                    atoms = _atoms_from_file(run_path, jid, cfg.file_format)
+                    chem = _chem_string(cfg, atoms)
+                    inp = get_input(config=cfg, chem=chem, val=prop_val)
+                    out = get_crystal_string_t(atoms)
+                    text = cfg.alpaca_prompt.format(cfg.instruction, inp, out) + EOS_TOKEN
+
+                    writer.write(
+                        {
+                            "id": jid,
+                            "instruction": cfg.instruction,
+                            "input": inp,
+                            "output": out,
+                            "text": text,
+                        }
+                    )
+
+            else:
+                # parallel record construction; deterministic flush in idx order (added)
+                buffer = {}
+                next_idx = 0
+                futures = {}
+
+                def _flush_ready():
+                    nonlocal next_idx
+                    while next_idx in buffer:
+                        rec = buffer.pop(next_idx)
+                        if rec is not None:
+                            if next_idx < num_train:
+                                w = w_train
+                            elif next_idx < num_train + num_val:
+                                w = w_val
+                            else:
+                                w = w_test
+                            w.write(rec)
+                        next_idx += 1
+
+                with ProcessPoolExecutor(
+                    max_workers=record_num_proc,
+                    initializer=_worker_init,
+                    initargs=(raw_cfg, run_path, EOS_TOKEN),
+                ) as ex:
+                    for idx, row in enumerate(tqdm(reader, total=n_all)):
+                        if idx >= n_target:
+                            break
+                        if not row:
+                            buffer[idx] = None
+                            _flush_ready()
+                            continue
+
+                        jid = row[0]
+                        prop_val = _parse_prop(row, separator=cfg.separator)
+                        if str(prop_val).strip().lower() == "na":
+                            buffer[idx] = None
+                            _flush_ready()
+                            continue
+
+                        while len(futures) >= max_in_flight:
+                            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                            for fut in done:
+                                i_done = futures.pop(fut)
+                                buffer[i_done] = fut.result()
+                            _flush_ready()
+
+                        fut = ex.submit(_build_record_worker, jid, prop_val)
+                        futures[fut] = idx
+
+                    for fut in as_completed(list(futures.keys())):
+                        i_done = futures[fut]
+                        buffer[i_done] = fut.result()
+                        _flush_ready()
+
+                _flush_ready()
+
     finally:
         w_train.close()
         w_val.close()
