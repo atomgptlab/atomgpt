@@ -399,12 +399,15 @@ def main(config_file=None):
         tok.pad_token = tok.eos_token
 
     def tok_fn(batch):
-        return tok(
+        out = tok(
             batch["text"],
             truncation=True,
             max_length=pretok_max_len,
             padding=False,
         )
+        out["labels"] = out["input_ids"]
+        return out
+
 
     tok_ds = ds.map(
         tok_fn,
