@@ -265,7 +265,8 @@ def main(config_file=None):
     w_val = _ShardWriter(pretok_dir, "val", records_per_shard=records_per_shard)
     w_test = _ShardWriter(pretok_dir, "test", records_per_shard=records_per_shard)
 
-    EOS_TOKEN = "</s>"
+    tok = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True)
+    EOS_TOKEN = tok.eos_token or "</s>"
     n_target = num_train + num_val + num_test
 
     # choose record-building workers from Slurm/env (added)
