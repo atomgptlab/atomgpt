@@ -825,14 +825,7 @@ def main(config_file=None):
     )
     """
 
-    trainer = SFTTrainer(
-        model=model,
-        train_dataset=tokenized_train,
-        eval_dataset=tokenized_eval,
-        # train_dataset = train_dataset,
-        # tokenizer = tokenizer,
-        tokenizer=tokenizer,
-        args=SFTConfig(
+    sft_args = SFTConfig(
             max_seq_length=config.max_seq_length,
             per_device_train_batch_size=config.per_device_train_batch_size,
             per_device_eval_batch_size=config.per_device_eval_batch_size,
@@ -851,8 +844,16 @@ def main(config_file=None):
             eval_strategy=config.evaluation_strategy,
             eval_steps=config.eval_steps,
             report_to=config.report_to,
-        ),
     )
+
+    trainer = SFTTrainer(
+            model=model,
+            train_dataset=tokenized_train,
+            eval_dataset=tokenized_eval,
+            args=sft_args,
+    )
+
+        
     if callback_samples > 0:
         callback = ExampleTrainerCallback(
             some_tokenized_dataset=tokenized_eval,
