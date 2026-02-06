@@ -494,15 +494,46 @@ def main(config_file=None):
     use_presharded = preshard_root is not None
 
     if use_presharded:
-        print("Using presharded dataset:", preshard_root)
-        ds_alpaca = load_from_disk(os.path.join(preshard_root, "alpaca"))
-        train_dataset = ds_alpaca["train"]
-        if "validation" in ds_alpaca and len(ds_alpaca["validation"]) > 0:
-            eval_dataset = ds_alpaca["validation"]
+        print("Using presharded dataset root:", preshard_root)
+        
+        alpaca_dir = os.path.join(preshard_root, "alpaca")
+        tok_dir = os.path.join(preshard_root, "tokenized")
+    
+        if not os.path.exists(os.path.join(alpaca_dir, "dataset_dict.json")):
+            raise FileNotFoundError(f"Missing alpaca dataset_dict.json at: {alpaca_dir}")
+        if not os.path.exists(os.path.join(tok_dir, "dataset_dict.json")):
+            raise FileNotFoundError(f"Missing tokenized dataset_dict.json at: {tok_dir}")
+    
+        ds_alpaca = load_from_disk(alpaca_dir)
+        ds_tok = load_from_disk(tok_dir)
+
+        tokenized_train = ds_tok["train"]
+        if "validation" in ds_tok and len(ds_tok["validation"]) > 0:
+            tokenized_eval = ds_tok["validation"]
         else:
-            eval_dataset = ds_alpaca["test"]
-        m_test = ds_alpaca["test"] if "test" in ds_alpaca else eval_dataset
-        print("Sample:\n", train_dataset[0])
+            tokenized_eval = ds_tok["test"]
+
+        def _ensure_labels(ds):
+            if "labels" in ds.column_names:
+                return ds
+            if "input_ids" not in ds.column_names:
+                raise ValueError(f"Tokenized dataset missing input_ids. Columns={ds.column_names}")
+            return ds.map(lambda b: {"labels": b["input_ids"]}, batched=True)
+    
+        tokenized_train = _ensure_labels(tokenized_train)
+        tokenized_eval = _ensure_labels(tokenized_eval)
+
+        keep_cols = [c for c in ("input_ids", "attention_mask", "labels") if c in tokenized_train.column_names]
+        tokenized_train.set_format(type="torch", columns=keep_cols)
+        tokenized_eval.set_format(type="torch", columns=keep_cols)
+
+        if "test" in ds_alpaca and len(ds_alpaca["test"]) > 0:
+            m_test = ds_alpaca["test"]
+        elif "validation" in ds_alpaca and len(ds_alpaca["validation"]) > 0:
+            m_test = ds_alpaca["validation"]
+        else:
+            last-resort: small slice of train
+            m_test = ds_alpaca["train"].select(range(min(1024, len(ds_alpaca["train"]))))
     else:
         with open(id_prop_path, "r") as f:
             reader = csv.reader(f)
@@ -666,11 +697,11 @@ def main(config_file=None):
             loftq_config=None,  # And LoftQ
         )
 
-    EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
-    # tokenizer.pad_token_id = tokenizer.eos_token_id
-    # model.resize_token_embeddings(len(tokenizer))
-
     if not use_presharded:
+        EOS_TOKEN = tokenizer.eos_token  # Must add EOS_TOKEN
+        # tokenizer.pad_token_id = tokenizer.eos_token_id
+        # model.resize_token_embeddings(len(tokenizer))
+        
         train_dataset = load_dataset(
             "json",
             data_files=alpaca_prop_train_filename,
@@ -686,48 +717,48 @@ def main(config_file=None):
             # "json", data_files="alpaca_prop_train.json", split="train"
         )
 
-    formatting_prompts_func_with_prompt = partial(
-        formatting_prompts_func, alpaca_prompt=config.alpaca_prompt
-    )
-
-    def tokenize_function(example):
-        return tokenizer(
-            example["text"],
-            padding="max_length",
-            truncation=True,
-            max_length=config.max_seq_length,
+        formatting_prompts_func_with_prompt = partial(
+            formatting_prompts_func, alpaca_prompt=config.alpaca_prompt
         )
-
-    train_dataset = train_dataset.map(
-        formatting_prompts_func_with_prompt,
-        batched=True,
-        num_proc=config.dataset_num_proc,
-    )
-    eval_dataset = eval_dataset.map(
-        formatting_prompts_func_with_prompt,
-        batched=True,
-        num_proc=config.dataset_num_proc,
-    )
-    # Compute the actual max sequence length in raw text
-    lengths = [
-        len(tokenizer(example["text"], truncation=False)["input_ids"])
-        for example in eval_dataset
-    ]
-    max_seq_length = max(lengths)
-    print(f"🧠 Suggested max_seq_length based on dataset: {max_seq_length}")
-
-    tokenized_train = train_dataset.map(
-        tokenize_function, batched=True, num_proc=config.dataset_num_proc
-    )
-    tokenized_eval = eval_dataset.map(
-        tokenize_function, batched=True, num_proc=config.dataset_num_proc
-    )
-    tokenized_train.set_format(
-        type="torch", columns=["input_ids", "attention_mask", "output"]
-    )
-    tokenized_eval.set_format(
-        type="torch", columns=["input_ids", "attention_mask", "output"]
-    )
+    
+        def tokenize_function(example):
+            return tokenizer(
+                example["text"],
+                padding="max_length",
+                truncation=True,
+                max_length=config.max_seq_length,
+            )
+    
+        train_dataset = train_dataset.map(
+            formatting_prompts_func_with_prompt,
+            batched=True,
+            num_proc=config.dataset_num_proc,
+        )
+        eval_dataset = eval_dataset.map(
+            formatting_prompts_func_with_prompt,
+            batched=True,
+            num_proc=config.dataset_num_proc,
+        )
+        # Compute the actual max sequence length in raw text
+        lengths = [
+            len(tokenizer(example["text"], truncation=False)["input_ids"])
+            for example in eval_dataset
+        ]
+        max_seq_length = max(lengths)
+        print(f"🧠 Suggested max_seq_length based on dataset: {max_seq_length}")
+    
+        tokenized_train = train_dataset.map(
+            tokenize_function, batched=True, num_proc=config.dataset_num_proc
+        )
+        tokenized_eval = eval_dataset.map(
+            tokenize_function, batched=True, num_proc=config.dataset_num_proc
+        )
+        tokenized_train.set_format(
+            type="torch", columns=["input_ids", "attention_mask", "output"]
+        )
+        tokenized_eval.set_format(
+            type="torch", columns=["input_ids", "attention_mask", "output"]
+        )
 
     """
     trainer = SFTTrainer(
