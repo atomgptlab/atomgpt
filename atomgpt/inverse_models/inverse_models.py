@@ -848,7 +848,7 @@ def main(config_file=None):
             num_train_epochs=config.num_epochs,
             save_strategy=config.save_strategy,
             save_steps=config.save_steps,
-            evaluation_strategy=config.evaluation_strategy,
+            eval_strategy=config.evaluation_strategy,
             eval_steps=config.eval_steps,
             report_to=config.report_to,
         ),
