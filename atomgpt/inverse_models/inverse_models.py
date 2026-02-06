@@ -261,7 +261,7 @@ def _validate_atoms(atoms):
     try:
         lat = np.asarray(getattr(atoms, "lattice_mat", None), dtype=float)
         if lat.shape != (3, 3):
-            return False, f"bad_lattice_shape:{getattr(atoms,'lattice_mat',none)}"
+            return False, f"bad_lattice_shape:{getattr(atoms,'lattice_mat',None)}"
         if not np.isfinite(lat).all():
             return False, "nonfinite_lattice"
         n = getattr(atoms, "num_atoms", None)
@@ -495,45 +495,61 @@ def main(config_file=None):
 
     if use_presharded:
         print("Using presharded dataset root:", preshard_root)
-        
+
         alpaca_dir = os.path.join(preshard_root, "alpaca")
         tok_dir = os.path.join(preshard_root, "tokenized")
-    
+
         if not os.path.exists(os.path.join(alpaca_dir, "dataset_dict.json")):
             raise FileNotFoundError(f"Missing alpaca dataset_dict.json at: {alpaca_dir}")
         if not os.path.exists(os.path.join(tok_dir, "dataset_dict.json")):
             raise FileNotFoundError(f"Missing tokenized dataset_dict.json at: {tok_dir}")
-    
+
         ds_alpaca = load_from_disk(alpaca_dir)
         ds_tok = load_from_disk(tok_dir)
 
-        tokenized_train = ds_tok["train"]
-        if "validation" in ds_tok and len(ds_tok["validation"]) > 0:
-            tokenized_eval = ds_tok["validation"]
-        else:
-            tokenized_eval = ds_tok["test"]
+        if "train" not in ds_tok:
+            raise ValueError(f"Tokenized dataset missing 'train' split. Splits={list(ds_tok.keys())}")
 
-        def _ensure_labels(ds):
-            if "labels" in ds.column_names:
-                return ds
-            if "input_ids" not in ds.column_names:
-                raise ValueError(f"Tokenized dataset missing input_ids. Columns={ds.column_names}")
-            return ds.map(lambda b: {"labels": b["input_ids"]}, batched=True)
-    
-        tokenized_train = _ensure_labels(tokenized_train)
-        tokenized_eval = _ensure_labels(tokenized_eval)
+        tokenized_train = ds_tok["train"]
+        tokenized_eval = ds_tok["validation"]
+
+        need = {"input_ids", "attention_mask"}
+        missing = sorted(list(need - set(tokenized_train.column_names)))
+        if missing:
+            raise ValueError(
+                f"Tokenized train split missing columns={missing}. "
+                f"Have={tokenized_train.column_names}"
+            )
+
+        if "labels" not in tokenized_train.column_names:
+            _tok = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
+            if _tok.pad_token is None:
+                _tok.pad_token = _tok.eos_token or _tok.unk_token
+            pad_id = _tok.pad_token_id
+
+            def _add_labels(batch):
+                batch["labels"] = [
+                    [(-100 if t == pad_id else t) for t in ids]
+                    for ids in batch["input_ids"]
+                ]
+                return batch
+
+            tokenized_train = tokenized_train.map(_add_labels, batched=True)
+            tokenized_eval = tokenized_eval.map(_add_labels, batched=True)
 
         keep_cols = [c for c in ("input_ids", "attention_mask", "labels") if c in tokenized_train.column_names]
+        drop_train = [c for c in tokenized_train.column_names if c not in keep_cols]
+        drop_eval = [c for c in tokenized_eval.column_names if c not in keep_cols]
+        if drop_train:
+            tokenized_train = tokenized_train.remove_columns(drop_train)
+        if drop_eval:
+            tokenized_eval = tokenized_eval.remove_columns(drop_eval)
+
         tokenized_train.set_format(type="torch", columns=keep_cols)
         tokenized_eval.set_format(type="torch", columns=keep_cols)
 
-        if "test" in ds_alpaca and len(ds_alpaca["test"]) > 0:
-            m_test = ds_alpaca["test"]
-        elif "validation" in ds_alpaca and len(ds_alpaca["validation"]) > 0:
-            m_test = ds_alpaca["validation"]
-        else:
-            last-resort: small slice of train
-            m_test = ds_alpaca["train"].select(range(min(1024, len(ds_alpaca["train"]))))
+        m_test = ds_alpaca["test"]
+
     else:
         with open(id_prop_path, "r") as f:
             reader = csv.reader(f)
@@ -721,13 +737,23 @@ def main(config_file=None):
             formatting_prompts_func, alpaca_prompt=config.alpaca_prompt
         )
     
-        def tokenize_function(example):
-            return tokenizer(
-                example["text"],
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+        pad_id = tokenizer.pad_token_id
+
+        def tokenize_function(batch):
+            enc = tokenizer(
+                batch["text"],
                 padding="max_length",
                 truncation=True,
                 max_length=config.max_seq_length,
+                return_attention_mask=True,
             )
+            enc["labels"] = [
+                [(-100 if t == pad_id else t) for t in ids]
+                for ids in enc["input_ids"]
+            ]
+            return enc
     
         train_dataset = train_dataset.map(
             formatting_prompts_func_with_prompt,
@@ -748,17 +774,20 @@ def main(config_file=None):
         print(f"🧠 Suggested max_seq_length based on dataset: {max_seq_length}")
     
         tokenized_train = train_dataset.map(
-            tokenize_function, batched=True, num_proc=config.dataset_num_proc
+            tokenize_function,
+            batched=True,
+            num_proc=config.dataset_num_proc,
+            remove_columns=train_dataset.column_names,
         )
         tokenized_eval = eval_dataset.map(
-            tokenize_function, batched=True, num_proc=config.dataset_num_proc
+            tokenize_function,
+            batched=True,
+            num_proc=config.dataset_num_proc,
+            remove_columns=eval_dataset.column_names,
         )
-        tokenized_train.set_format(
-            type="torch", columns=["input_ids", "attention_mask", "output"]
-        )
-        tokenized_eval.set_format(
-            type="torch", columns=["input_ids", "attention_mask", "output"]
-        )
+
+        tokenized_train.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
+        tokenized_eval.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
 
     """
     trainer = SFTTrainer(
@@ -804,7 +833,6 @@ def main(config_file=None):
         # tokenizer = tokenizer,
         tokenizer=tokenizer,
         args=SFTConfig(
-            dataset_text_field="text",
             max_seq_length=config.max_seq_length,
             per_device_train_batch_size=config.per_device_train_batch_size,
             per_device_eval_batch_size=config.per_device_eval_batch_size,

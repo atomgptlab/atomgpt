@@ -393,32 +393,48 @@ def main(config_file=None):
     ds = load_dataset("json", data_files=data_files)
 
     _save_to_disk(ds, os.path.join(pretok_dir, "alpaca"), max_shard_size="1GB")
-    _save_to_disk(ds.select_columns(["id", "text"]), os.path.join(pretok_dir, "text"), max_shard_size="1GB")
 
-    tok = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+    ds_text = type(ds)({k: v.select_columns(["id", "text"]) for k, v in ds.items()})
+    _save_to_disk(ds_text, os.path.join(pretok_dir, "text"), max_shard_size="1GB")
 
-    def tok_fn(batch):
-        out = tok(
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
+
+    pad_to_max = True
+    padding = "max_length"
+
+    def tokenize_batch(batch):
+        enc = tokenizer(
             batch["text"],
             truncation=True,
             max_length=pretok_max_len,
-            padding=False,
+            padding=padding,
+            return_attention_mask=True,
         )
-        out["labels"] = out["input_ids"]
-        return out
 
+        pad_id = tokenizer.pad_token_id
+        enc["labels"] = [
+            [(-100 if t == pad_id else t) for t in ids] for ids in enc["input_ids"]
+        ]
+
+        return enc
+
+    keep_cols = {"id"}
+    remove_cols = [c for c in ds["train"].column_names if c not in keep_cols]
 
     tok_ds = ds.map(
-        tok_fn,
+        tokenize_batch,
         batched=True,
         num_proc=cfg.dataset_num_proc,
-        remove_columns=["instruction", "input", "output", "text"],
+        remove_columns=remove_cols,
+        desc="Tokenizing",
     )
+
     _save_to_disk(tok_ds, os.path.join(pretok_dir, "tokenized"), max_shard_size="1GB")
 
     print("Done. Seconds:", time.time() - t0)
+
 
 
 if __name__ == "__main__":
