@@ -844,6 +844,7 @@ def main(config_file=None):
             eval_strategy=config.evaluation_strategy,
             eval_steps=config.eval_steps,
             report_to=config.report_to,
+            dataloader_drop_last=True,
     )
 
     trainer = SFTTrainer(
@@ -862,9 +863,9 @@ def main(config_file=None):
             max_length=config.max_seq_length,
             callback_samples=callback_samples,
         )
-        trainer.add_callback(callback)
+        #trainer.add_callback(callback)
     gpu_usage = PrintGPUUsageCallback()
-    trainer.add_callback(gpu_usage)
+    #trainer.add_callback(gpu_usage)
     trainer_stats = trainer.train()
     trainer.save_model(config.model_save_path)
     # model.save_pretrained(config.model_save_path)
