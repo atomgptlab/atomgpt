@@ -260,6 +260,9 @@ def main(config_file=None):
     with open(os.path.join(pretok_dir, "pretok_metadata.json"), "w") as f:
         f.write(json.dumps(pretok_meta.dict(), indent=2))
 
+    print("We recommend using multiple CPUs for preshard_dataset.py for large datasets")
+    print("This can be achieved by setting num_proc=<num CPUs for this task> in config.json")
+
     records_per_shard = int(os.environ.get("PRETOK_RECORDS_PER_SHARD", "100000"))
     w_train = _ShardWriter(pretok_dir, "train", records_per_shard=records_per_shard)
     w_val = _ShardWriter(pretok_dir, "val", records_per_shard=records_per_shard)
