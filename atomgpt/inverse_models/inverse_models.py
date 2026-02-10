@@ -470,6 +470,17 @@ def main(config_file=None):
     print("config_file", config_file)
     config = loadjson(config_file)
     config = TrainingPropConfig(**config)
+    cfg_dir = os.path.dirname(os.path.abspath(config_file))
+    def _bench_path(p: str) -> str:
+        p = str(p)
+        if not p.strip():
+            return p
+        if os.path.isabs(p):
+            return os.path.join(cfg_dir, os.path.basename(p))
+        return os.path.join(cfg_dir, p)
+    config.csv_out = _bench_path(config.csv_out)
+    if getattr(config, "miss_csv", None):
+        config.miss_csv = _bench_path(config.miss_csv)
     pprint.pprint(config.dict())
     if not os.path.exists(config.output_dir):
         os.makedirs(config.output_dir)
