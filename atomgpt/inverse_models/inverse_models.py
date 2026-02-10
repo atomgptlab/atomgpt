@@ -876,6 +876,7 @@ def main(config_file=None):
     #    dtype=config.dtype,
     #    load_in_4bit=config.load_in_4bit,
     # )
+    t2 = time.time()
     model = trainer.model
     FastLanguageModel.for_inference(model)  # Enable native 2x faster inference
     # model, tokenizer, config = load_model(path=config.model_save_path)
@@ -896,6 +897,7 @@ def main(config_file=None):
     # )
     # t2 = time.time()
     # t1a = time.time()
+    t3 = time.time()
     evaluate(
         test_set=m_test,
         model=model,
@@ -903,8 +905,9 @@ def main(config_file=None):
         csv_out=config.csv_out,
         config=config,
     )
-    t2 = time.time()
+    t4 = time.time()
     print("Time taken:", t2 - t1)
+    print("Eval time taken:", t4 - t3)
 
 
 if __name__ == "__main__":
