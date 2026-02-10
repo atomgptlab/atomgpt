@@ -102,8 +102,8 @@ class TrainingPropConfig(BaseSettings):
     gradient_accumulation_steps: int = 4
     num_train: Optional[int] = None
     num_test: Optional[int] = None
-    test_ratio: Optional[float] = 0.1
-    val_ratio: Optional[float] = 0.1
+    test_ratio: Optional[float] = 0.2
+    val_ratio: Optional[float] = 0.0
     model_save_path: str = "atomgpt_lora_model"
     lora_rank: Optional[int] = 16
     lora_alpha: Optional[int] = 16
