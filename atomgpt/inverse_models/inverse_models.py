@@ -855,7 +855,6 @@ def main(config_file=None):
             eval_strategy=config.evaluation_strategy,
             eval_steps=config.eval_steps,
             report_to=config.report_to,
-            dataloader_drop_last=True,
     )
 
     trainer = SFTTrainer(
